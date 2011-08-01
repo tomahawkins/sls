@@ -1,0 +1,51 @@
+graph nets {
+	supply1 [color="purple"];
+	supply0 [color="purple"];
+	ptree   [color="purple"];
+	ntree   [color="purple"];
+	ctrl    [color="purple"];
+
+	supply1 -- VDD
+	supply1 -- PS
+
+	supply0 -- GND
+	supply0 -- NS
+
+	ptree   -- PS
+	ptree   -- PD
+	ptree   -- ND
+	ptree   -- OUT
+
+	ntree   -- NS
+	ntree   -- ND
+	ntree   -- PD
+	ntree   -- OUT
+
+	ctrl    -- IN
+	ctrl    -- PG
+	ctrl    -- NG
+	ctrl    -- PD
+	ctrl    -- ND
+
+	/*
+	IN  -- PG
+	IN  -- NG
+	VDD -- PS
+	GND -- NS
+
+	PD  -- OUT
+	PD  -- PS
+	PD  -- PD
+	PD  -- ND
+	PD  -- PG
+	PD  -- NG
+
+	ND  -- OUT
+	ND  -- NS
+	ND  -- ND
+	ND  -- PD
+	ND  -- PG
+	ND  -- NG
+	*/
+
+}
