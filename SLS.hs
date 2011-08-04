@@ -26,7 +26,7 @@ data Netlist = Netlist [Net] [Net] [Instance]  -- inputs, outputs, instance
 -- | Synthesis example.
 example :: IO ()
 example = do
-  a <- synthesize 2 3 4
+  a <- synthesize 1 1 5
     [ ("x", True , [("a", False)])
     , ("x", False, [("a", True )])
     ]
@@ -74,7 +74,7 @@ synthesize pCount nCount netCount truthTable = do
   where
 
   smt :: [CmdY]
-  smt = concatMap pinConfig pinConfigs ++ designRules pCount nCount netCount inputs outputs ++ netValueCombinations ++ netValueConstraints
+  smt = concatMap pinConfig pinConfigs ++ designRules pCount nCount inputs ++ netValueCombinations ++ netValueConstraints
 
   pinConfig :: Name -> [CmdY]
   pinConfig name = [intVar name, ASSERT $ AND [VarE name :>= LitI 0, VarE name :< LitI (fromIntegral netCount)]]
@@ -96,6 +96,9 @@ synthesize pCount nCount netCount truthTable = do
   netValues :: [(Int, [Bool])]
   netValues = zip [0 ..] $ sequence $ replicate netCount [False, True]
 
+  -- XXX Only enumerate valid truth table values.  Not everything.  But you don't know the net configuration.  ???
+  -- XXX Make vdd, gnd, and inputs hard coded to the the first nets.  Then only valid input sequences would need to be checked.
+
   -- Net values bound to pins.
   netValueCombinations :: [CmdY]
   netValueCombinations = concatMap f netValues
@@ -111,35 +114,33 @@ synthesize pCount nCount netCount truthTable = do
 
   -- Constraints on net values.
   netValueConstraints :: [CmdY]
-  netValueConstraints = [ASSERT $ OR $ map f netValues]
+  netValueConstraints = concatMap f netValues
     where
-    f :: (Int, [Bool]) -> ExpY
-    f (comb, _) = AND [power, pmos, nmos, io]
+    f :: (Int, [Bool]) -> [CmdY]
+    f (comb, _) = power ++ io
       where
       value :: String -> ExpY
       value config = VarE $ printf "%s_%d" config comb
-      power    = AND [value "vdd", NOT $ value "gnd"]
-      pmos     = AND [ NOT (value $ printf "pmos_%d_gate" i) :=> (value (printf "pmos_%d_source" i) := value (printf "pmos_%d_drain" i)) | i <- [0 .. pCount - 1] ]
-      nmos     = AND [     (value $ printf "nmos_%d_gate" i) :=> (value (printf "nmos_%d_source" i) := value (printf "nmos_%d_drain" i)) | i <- [0 .. nCount - 1] ]
-      io       = AND [ AND [ value input := LitB val | (input, val) <- inputs ] :=> (value output := LitB val) | (output, val, inputs) <- truthTable ]
+      power    = [ASSERT $ value "vdd", ASSERT $ NOT $ value "gnd"]
+      pmos     = [ NOT (value $ printf "pmos_%d_gate" i) :=> (value (printf "pmos_%d_source" i) := value (printf "pmos_%d_drain" i)) | i <- [0 .. pCount - 1] ]
+      nmos     = [     (value $ printf "nmos_%d_gate" i) :=> (value (printf "nmos_%d_source" i) := value (printf "nmos_%d_drain" i)) | i <- [0 .. nCount - 1] ]
+      io       = [ ASSERT $ AND [ value input := LitB val | (input, val) <- inputs ] :=> AND (pmos ++ nmos ++ [value output := LitB val]) | (output, val, inputs) <- truthTable ]
 
 -- Connectivity design rules.
-designRules :: Int -> Int -> Int -> [Name] -> [Name] -> [CmdY]
-designRules pCount nCount netCount inputs' outputs' = inputsNotConnectedToVDD
-                                                   ++ inputsNotConnectedToGND
-                                                   ++ inputsNotConnectedToDrains
-                                                   ++ inputsNotConnectedToSources
-                                                   ++ inputsNotConnectedToOtherInputs
-                                                   ++ drainsNotConnectedToVDD
-                                                   ++ drainsNotConnectedToGND
-                                                   ++ pSourcesNotConnectedToGND
-                                                   ++ nSourcesNotConnectedToVDD
+designRules :: Int -> Int -> [Name] -> [CmdY]
+designRules pCount nCount inputs' = inputsNotConnectedToVDD
+                                 ++ inputsNotConnectedToGND
+                                 ++ inputsNotConnectedToDrains
+                                 ++ inputsNotConnectedToSources
+                                 ++ inputsNotConnectedToOtherInputs
+                                 ++ drainsNotConnectedToVDD
+                                 ++ drainsNotConnectedToGND
+                                 ++ pSourcesNotConnectedToGND
+                                 ++ nSourcesNotConnectedToVDD
   where
   vdd = VarE "vdd"
   gnd = VarE "gnd"
   inputs   = map VarE inputs'
-  outputs  = map VarE outputs'
-  gates    = [ VarE $ printf "pmos_%d_gate"   i | i <- [0 .. pCount - 1] ] ++ [ VarE $ printf "nmos_%d_gate" i | i <- [0 .. nCount - 1] ]
   pDrains  = [ VarE $ printf "pmos_%d_drain"  i | i <- [0 .. pCount - 1] ]
   pSources = [ VarE $ printf "pmos_%d_source" i | i <- [0 .. pCount - 1] ]
   nDrains  = [ VarE $ printf "nmos_%d_drain"  i | i <- [0 .. nCount - 1] ]
