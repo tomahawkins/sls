@@ -42,7 +42,7 @@ netlist name (Netlist ins outs instances) = unlines
   , "\t, input  gnd"
   , unlines [ "\t, input  " ++ name | name <- ins ] ++ unlines [ "\t, output " ++ name | name <- outs ] ++ "\t);"
   , ""
-  , unlines [ "wire " ++ name | name <- nub (concatMap nets instances) \\ (["vdd", "gnd"] ++ ins ++ outs) ]
+  , unlines [ printf "wire %s;" name | name <- nub (concatMap nets instances) \\ (["vdd", "gnd"] ++ ins ++ outs) ]
   , unlines $ map instantiate instances
   , "endmodule"
   ]
@@ -66,14 +66,15 @@ synthesize :: Int -> Int -> Int -> TruthTable -> IO (Maybe Netlist)
 synthesize pCount nCount netCount truthTable = do
     writeFile "test.yices" $ unlines $ map show $ smt ++ [CHECK]
     a <- quickCheckY "yices" [] smt
-    print a
     case a of
-      Sat a -> return $ Just $ configNetlist pCount nCount inputs outputs a
+      Sat a -> do
+        writeFile "result.yices" $ unlines $ map show a
+        return $ Just $ configNetlist pCount nCount inputs outputs a
       a -> print a >> return Nothing
   where
 
   smt :: [CmdY]
-  smt = concatMap pinConfig pinConfigs ++ netValueCombinations ++ netValueConstraints
+  smt = concatMap pinConfig pinConfigs ++ designRules pCount nCount netCount inputs outputs ++ netValueCombinations ++ netValueConstraints
 
   pinConfig :: Name -> [CmdY]
   pinConfig name = [intVar name, ASSERT $ AND [VarE name :>= LitI 0, VarE name :< LitI (fromIntegral netCount)]]
@@ -85,8 +86,8 @@ synthesize pCount nCount netCount truthTable = do
   pinConfigs :: [Name]
   pinConfigs = ["vdd", "gnd"]
       ++ inputs ++ outputs
-      ++ concat [ transistorPins $ printf "pmos_%d" i | i <- [0.. pCount] ]
-      ++ concat [ transistorPins $ printf "nmos_%d" i | i <- [0.. nCount] ]
+      ++ concat [ transistorPins $ printf "pmos_%d" i | i <- [0 .. pCount - 1] ]
+      ++ concat [ transistorPins $ printf "nmos_%d" i | i <- [0 .. nCount - 1] ]
 
   transistorPins :: Name -> [Name]
   transistorPins name = [ printf "%s_%s" name pin | pin <- ["gate", "source", "drain"] ]
@@ -113,17 +114,52 @@ synthesize pCount nCount netCount truthTable = do
   netValueConstraints = [ASSERT $ OR $ map f netValues]
     where
     f :: (Int, [Bool]) -> ExpY
-    f (comb, netValues) = power
+    f (comb, _) = AND [power, pmos, nmos, io]
       where
-      power = AND [VarE $ printf "vdd_%d" comb, NOT $ VarE $ printf "gnd_%d" comb]
-      
+      value :: String -> ExpY
+      value config = VarE $ printf "%s_%d" config comb
+      power    = AND [value "vdd", NOT $ value "gnd"]
+      pmos     = AND [ NOT (value $ printf "pmos_%d_gate" i) :=> (value (printf "pmos_%d_source" i) := value (printf "pmos_%d_drain" i)) | i <- [0 .. pCount - 1] ]
+      nmos     = AND [     (value $ printf "nmos_%d_gate" i) :=> (value (printf "nmos_%d_source" i) := value (printf "nmos_%d_drain" i)) | i <- [0 .. nCount - 1] ]
+      io       = AND [ AND [ value input := LitB val | (input, val) <- inputs ] :=> (value output := LitB val) | (output, val, inputs) <- truthTable ]
+
+-- Connectivity design rules.
+designRules :: Int -> Int -> Int -> [Name] -> [Name] -> [CmdY]
+designRules pCount nCount netCount inputs' outputs' = inputsNotConnectedToVDD
+                                                   ++ inputsNotConnectedToGND
+                                                   ++ inputsNotConnectedToDrains
+                                                   ++ inputsNotConnectedToSources
+                                                   ++ inputsNotConnectedToOtherInputs
+                                                   ++ drainsNotConnectedToVDD
+                                                   ++ drainsNotConnectedToGND
+                                                   ++ pSourcesNotConnectedToGND
+                                                   ++ nSourcesNotConnectedToVDD
+  where
+  vdd = VarE "vdd"
+  gnd = VarE "gnd"
+  inputs   = map VarE inputs'
+  outputs  = map VarE outputs'
+  gates    = [ VarE $ printf "pmos_%d_gate"   i | i <- [0 .. pCount - 1] ] ++ [ VarE $ printf "nmos_%d_gate" i | i <- [0 .. nCount - 1] ]
+  pDrains  = [ VarE $ printf "pmos_%d_drain"  i | i <- [0 .. pCount - 1] ]
+  pSources = [ VarE $ printf "pmos_%d_source" i | i <- [0 .. pCount - 1] ]
+  nDrains  = [ VarE $ printf "nmos_%d_drain"  i | i <- [0 .. nCount - 1] ]
+  nSources = [ VarE $ printf "nmos_%d_source" i | i <- [0 .. nCount - 1] ]
+  inputsNotConnectedToVDD = [ ASSERT $ vdd :/= input | input <- inputs ]
+  inputsNotConnectedToGND = [ ASSERT $ gnd :/= input | input <- inputs ]
+  inputsNotConnectedToDrains  = [ ASSERT $ input :/= drain  | input <- inputs, drain  <- pDrains  ++ nDrains  ]
+  inputsNotConnectedToSources = [ ASSERT $ input :/= source | input <- inputs, source <- pSources ++ nSources ]
+  inputsNotConnectedToOtherInputs = [ ASSERT $ VarE a :/= VarE b | a <- inputs', b <- inputs', a /= b ]
+  drainsNotConnectedToVDD = [ ASSERT $ vdd :/= drain | drain <- pDrains ++ nDrains ]
+  drainsNotConnectedToGND = [ ASSERT $ gnd :/= drain | drain <- pDrains ++ nDrains ]
+  pSourcesNotConnectedToGND = [ ASSERT $ gnd :/= source | source <- pSources ]
+  nSourcesNotConnectedToVDD = [ ASSERT $ vdd :/= source | source <- nSources ]
 
 
 configNetlist :: Int -> Int -> [Name] -> [Name] -> [ExpY] -> Netlist
 configNetlist pCount nCount inputs outputs result = Netlist inputs outputs $ pmos ++ nmos ++ buf
   where
-  pmos = [ PMOS (f $ printf "pmos_%d_gate" i) (f $ printf "pmos_%d_source" i) (f $ printf "pmos_%d_drain" i) | i <- [0 .. pCount] ]
-  nmos = [ NMOS (f $ printf "nmos_%d_gate" i) (f $ printf "nmos_%d_source" i) (f $ printf "nmos_%d_drain" i) | i <- [0 .. nCount] ]
+  pmos = [ PMOS (f $ printf "pmos_%d_gate" i) (f $ printf "pmos_%d_source" i) (f $ printf "pmos_%d_drain" i) | i <- [0 .. pCount - 1] ]
+  nmos = [ NMOS (f $ printf "nmos_%d_gate" i) (f $ printf "nmos_%d_source" i) (f $ printf "nmos_%d_drain" i) | i <- [0 .. nCount - 1] ]
   buf  = [ BUF (f output) output | output <- outputs, output /= f output ]
 
   f :: Name -> Name
@@ -142,34 +178,6 @@ configNetlist pCount nCount inputs outputs result = Netlist inputs outputs $ pmo
     inputNets  = [ (net, name) | (name, net) <- config, elem name (["vdd", "gnd"] ++ inputs) ]
     outputNets = [ (net, name) | (name, net) <- config, elem name outputs ]
 
-{-
-truthTableRow :: Int -> Int -> Int -> (Int, TruthTableRow) -> [CmdY]
-truthTableRow pCount nCount netCount (row, (outputName, outputValue, inputs)) = map boolVar nets ++ inputValues ++ outputValues
-  where
-  nets :: [Name]
-  nets = [ printf "net_%d_%d" net row | net <- [0 .. netCount - 1] ]
-  inputValues  = [ ASSERT $ (VarE inputName  := LitI (fromIntegral net)) :=> (VarE (printf "net_%d_%d" net row) := LitB inputValue ) | (inputName, inputValue) <- inputs, net <- [0 .. netCount - 1] ]
-  outputValues = [ ASSERT $ (VarE outputName := LitI (fromIntegral net)) :=> (VarE (printf "net_%d_%d" net row) := LitB outputValue) | net <- [0 .. netCount - 1] ]
-
-  pmosValues = concat
-    [ [ boolVar gate
-      , boolVar source
-      , boolVar drain
-      , ASSERT $ (VarE gate' := Lit (fromIntegral net)) :=> (VarE gate := VarE (printf "net_%d_%d" net row))  -- XXX This is not going to work.  What happens when a pin is floating?  SMT will pick a value to make it meet the spec.  Need to handle 4-state logic (10xz).
-      ]
-    | trans <- [0 .. pCount - 1]
-    , let gate'   = printf "pmos_%d_gate"   trans
-          source' = printf "pmos_%d_source" trans
-          drain'  = printf "pmos_%d_drain"  trans
-          gate    = printf "%s_%d" gate'   row
-          source  = printf "%s_%d" source' row
-          drain   = printf "%s_%d" drain'  row
-    , net <- [0 .. netCount - 1]
-    ]
-
-    ASSERT $ (VarE outputName := LitI (fromIntegral net)) :=> (VarE (printf "net_%d_%d" net row) := LitB outputValue) | net <- [0 .. netCount - 1] ]
--}
-
 boolVar :: Name -> CmdY
 boolVar name = DEFINE (name, VarT "bool") Nothing
 
@@ -180,11 +188,10 @@ intVar name = DEFINE (name, VarT "int") Nothing
 {-
 CMOS design rules.
 
-- Each net has >= 2 connecting pins.
 - Inputs can only connect to gates and outputs.
 - Inputs never tied to other inputs.
 - PMOS sources can only connect to PMOS A net with a connecting gate
--
-...
+
+- Single connected nets (floating pin) or vdd or gnd connected to a gate is sign further reduction can be obtained.
 -}
 
