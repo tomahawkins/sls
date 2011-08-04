@@ -3,9 +3,9 @@ module SLS
   , Name
   , Instance (..)
   , Netlist  (..)
-  , Logic    (..)
-  , code
-  , test
+  , synthesize
+  , netlist
+  , example
   ) where
 
 import Data.List
@@ -19,12 +19,24 @@ type Name = String
 data Instance
   = PMOS Net Net Net  -- gate, source, drain
   | NMOS Net Net Net  -- gate, source, drain
+  | BUF  Net Net      -- input, output
 
-data Netlist = Netlist Name [Net] [Net] [Instance]  -- name, inputs, outputs, instance
+data Netlist = Netlist [Net] [Net] [Instance]  -- inputs, outputs, instance
 
--- Output a Verilog switch level netlist.
-code :: Netlist -> IO ()
-code (Netlist name ins outs instances) = writeFile (name ++ ".v") $ unlines
+-- | Synthesis example.
+example :: IO ()
+example = do
+  a <- synthesize 2 3 4
+    [ ("x", True , [("a", False)])
+    , ("x", False, [("a", True )])
+    ]
+  case a of
+    Nothing -> putStrLn "Synthesis failed."
+    Just a  -> putStrLn $ netlist "inverter" a
+
+-- | Output a Verilog switch level netlist.
+netlist :: Name -> Netlist -> String
+netlist name (Netlist ins outs instances) = unlines
   [ "module " ++ name
   , "\t( input  vdd"
   , "\t, input  gnd"
@@ -34,397 +46,145 @@ code (Netlist name ins outs instances) = writeFile (name ++ ".v") $ unlines
   , unlines $ map instantiate instances
   , "endmodule"
   ]
-
   where
   nets a = case a of
     PMOS a b c -> [a, b, c]
     NMOS a b c -> [a, b, c]
+    BUF  a b   -> [a, b]
 
   instantiate a = case a of
     PMOS gate source drain -> printf "pmos (%s, %s, %s);" drain source gate
     NMOS gate source drain -> printf "nmos (%s, %s, %s);" drain source gate
+    BUF  input output      -> printf "buf  (%s, %s);" output input
 
-test :: IO ()
-test = code $ Netlist "inverter" ["a"] ["x"]
-  [ PMOS "a" "vdd" "x"
-  , NMOS "a" "gnd" "x"
-  ]
+-- | Each row is output name and value, and a list of input names and values.
+type TruthTable = [TruthTableRow]
+type TruthTableRow  = (Name, Bool, [(Name, Bool)])
 
-synthesize :: Int -> Int -> [(Name, Logic)] -> IO (Maybe Netlist)
-synthesize transitors nets logic
-  | transitors < 2 = error "CMOS circuit requires at least 2 transitors."
-  | odd transitors = error "CMOS circuit requires an even number of transistors."
-  | otherwise = do
-
-data Logic
-  = Input Name
-  | Const Bool
-  | Not Logic
-  | And Logic Logic
-  | Or  Logic Logic
-
-data Cell = Cell
-  { cellName    :: Name
-  , cellArea    :: Int
-  , cellDelay   :: Int
-  , cellOutputs :: [(Name, Logic)]
-  }
-
-type Library = [Cell]
-
-lib :: Library
-lib =
-  [ Cell "not"   0 0 [("x", Not (Input "a"))]
-  , Cell "and2"  0 0 [("x", And (Input "a") (Input "b"))]
-  , Cell "or2"   0 0 [("x", Or  (Input "a") (Input "b"))]
-  , Cell "nand2" 0 0 [("x", Not $ And (Input "a") (Input "b"))]
-  , Cell "nor2"  0 0 [("x", Not $ Or  (Input "a") (Input "b"))]
-  ]
-
-{-
-optimize :: [[Cell]] -> Int -> Int -> [Logic] -> IO [Logic]
-optimize fabric maxArea maxDelay block = do
-  return ()
--}
-
-{-
--- | Verify a program with k-induction.
-verify :: FilePath -> Statement -> IO ()
-verify yices program = proveAssertions yices format program [] $ assertions program
+-- | Synthesis given the number of transistors, a number of available internal nets, and the logic function.
+synthesize :: Int -> Int -> Int -> TruthTable -> IO (Maybe Netlist)
+synthesize pCount nCount netCount truthTable = do
+    writeFile "test.yices" $ unlines $ map show $ smt ++ [CHECK]
+    a <- quickCheckY "yices" [] smt
+    print a
+    case a of
+      Sat a -> return $ Just $ configNetlist pCount nCount inputs outputs a
+      a -> print a >> return Nothing
   where
-  format = "%-" ++ show (maximum' [ length $ pathName $ assertionPath t program | (t, _, _) <- assertions program ]) ++ "s    "
 
--- | Path of an assertion.
-assertionPath :: Int -> Statement -> Path
-assertionPath t stmt = case f stmt of
-  Nothing -> error $ "theorem not found: " ++ show t
-  Just p  -> p
-  where
-  pair :: Statement -> Statement -> Maybe Path
-  pair a b = case (f a, f b) of
-    (Just a, _) -> Just a
-    (_, Just a) -> Just a
-    _ -> Nothing
-  f :: Statement -> Maybe Path
-  f a = case a of
-    Assert t' _ _ | t == t' -> Just []
-    Sequence a b -> pair a b
-    Branch _ a b -> pair a b
-    Label name a -> do
-      path <- f a
-      return $ name : path
-    _ -> Nothing
+  smt :: [CmdY]
+  smt = concatMap pinConfig pinConfigs ++ netValueCombinations ++ netValueConstraints
 
-proveAssertions :: FilePath -> String -> Statement -> [Int] -> [(Int, Int, E Bool)] -> IO ()
-proveAssertions _ _ _ _ [] = return ()
-proveAssertions yices format program lemmas ((id, k, _) : rest) = do
-  printf format name
-  hFlush stdout
-  env0 <- initEnv program
-  pass <- evalStateT (check yices name id lemmas program env0 k) env0
-  proveAssertions yices format program (if pass then id : lemmas else lemmas) rest
-  where
-  name = pathName $ assertionPath id program
+  pinConfig :: Name -> [CmdY]
+  pinConfig name = [intVar name, ASSERT $ AND [VarE name :>= LitI 0, VarE name :< LitI (fromIntegral netCount)]]
 
-data Result = Pass | Fail [ExpY] | Problem
+  inputs  = sort $ nub $ concat [ fst $ unzip a | (_, _, a) <- truthTable ]
+  outputs = sort $ nub [ name | (name, _, _) <- truthTable ]
 
--- | k-induction.
-check :: FilePath -> Name -> Int -> [Int] -> Statement -> Env -> Int -> Y Bool
-check yices name theorem lemmas program env0 k = do
-  mapM_ step [0 .. k - 1]
-  resultBasis <- checkBasis yices program env0
-  case resultBasis of
-    Fail a  -> do
-      liftIO (printf "FAILED: disproved basis (see %s.trace)\n" name)
-      writeTrace name a
-      return False
-    Problem -> error "Verify.check1"
-    Pass -> do
-      step k
-      resultStep <- checkStep yices
-      case resultStep of
-        Fail a  -> do
-	  liftIO (printf "inconclusive: unable to proved step (see %s.trace)\n" name)
-	  writeTrace name a
-	  return False
-        Problem -> error "Verify.check2"
-        Pass    -> do
-	  liftIO $ printf "proved\n"
-	  return True
-  where
-  step :: Int -> Y ()
-  step i = do
-      addTrace $ Step' i
-      sequence_ [ getVar' a >>= addTrace . State' (pathName path) | a@(input, path, _) <- sortBy f $ stmtVars program, not input ]
-      sequence_ [ addVar' a >>= addTrace . Input' (pathName path) | a@(input, path, _) <- sortBy f $ stmtVars program,     input ]
-      evalStmt theorem lemmas (LitB True) program
-  f (_, a, _) (_, b, _) = compare a b
+  -- | SMT vars for each pin configuration, i.e. which net it is connected to.
+  pinConfigs :: [Name]
+  pinConfigs = ["vdd", "gnd"]
+      ++ inputs ++ outputs
+      ++ concat [ transistorPins $ printf "pmos_%d" i | i <- [0.. pCount] ]
+      ++ concat [ transistorPins $ printf "nmos_%d" i | i <- [0.. nCount] ]
 
--- | Check induction step.
-checkStep :: FilePath -> Y Result
-checkStep yices = do
-  env <- get
-  r <- liftIO $ quickCheckY' yices [] $ reverse (cmds env) ++ [assert env] ++ [CHECK]
-  --liftIO $ writeFile "log.txt" $ unlines $ map show $ reverse (cmds env) ++ [assert env] ++ [CHECK]
-  return $ result r
-  where
-  assert env = case asserts env of
-    []     -> error "unexpected: induction step needs at least 1 step, got 0"
-    [_]    -> error "unexpected: induction step needs at least 2 steps, got 1"
-    a : b  -> ASSERT $ AND $ NOT a : b
+  transistorPins :: Name -> [Name]
+  transistorPins name = [ printf "%s_%s" name pin | pin <- ["gate", "source", "drain"] ]
 
--- | Check induction basis.
-checkBasis :: FilePath -> Statement -> Env -> Y Result
-checkBasis yices program env0 = do
-  env <- get
-  r <- liftIO $ quickCheckY' yices [] $ reverse (cmds env)
-          ++ [ASSERT $ NOT $ AND $ asserts env]
-          ++ [ ASSERT $ VarE (var env0 a) := evalConst' c | a@(input, _, c) <- stmtVars program, not input ]
-          ++ [CHECK]
-  return $ result r
+  -- All possible net value combinations.
+  netValues :: [(Int, [Bool])]
+  netValues = zip [0 ..] $ sequence $ replicate netCount [False, True]
 
-result :: ResY -> Result
-result a = case a of
-  Sat a   -> Fail a
-  UnSat _ -> Pass
-  InCon _ -> Problem
-  _ -> error $ "unexpected yices results: " ++ show a
-
-
-evalStmt :: Int -> [Int] -> ExpY -> Statement -> Y ()
-evalStmt theorem lemmas enabled a = case a of
-  Null -> return ()
-  Sequence a b -> evalStmt theorem lemmas enabled a >> evalStmt theorem lemmas enabled b
-  Assign a b -> assign a b
-  Assert id _ a
-    | elem id lemmas -> do
-      a <- evalExpr a
-      addCmd $ ASSERT (enabled :=> a)
-    | id == theorem -> do
-      a <- evalExpr a
-      b <- newBoolVar
-      addCmd $ ASSERT (VarE b := (enabled :=> a))
-      env <- get
-      put env { asserts = VarE b : asserts env }
-      addTrace $ Assert' b
-    | otherwise -> return ()
-  Assume id a
-    | elem id lemmas -> do
-      a <- evalExpr a
-      addCmd $ ASSERT (enabled :=> a)
-    | otherwise -> return ()
-  Branch a onTrue onFalse -> do
-    a <- evalExpr a
-    b <- newBoolVar
-    addCmd $ ASSERT (VarE b := a)
-    env0 <- get
-    put env0 { trace = [] }
-    evalStmt theorem lemmas (AND [enabled, a]) onTrue
-    env1 <- get
-    put env1 { trace = [] }
-    evalStmt theorem lemmas (AND [enabled, NOT a]) onFalse
-    env2 <- get
-    put env2 { trace = Branch' b (reverse $ trace env1) (reverse $ trace env2) : trace env0 }
-  Label name a -> do
-    env0 <- get
-    put env0 { trace = [] }
-    evalStmt theorem lemmas enabled a
-    env1 <- get
-    put env1 { trace = Label' name (reverse $ trace env1) : trace env0 }
-  where
-  assign :: AllE a => V a -> E a -> Y ()
-  assign a b = do
-    b <- evalExpr b
-    aPrev <- getVar a
-    aNext <- addVar a
-    addCmd $ ASSERT (VarE aNext := IF enabled b (VarE aPrev))
-    addTrace $ Assign' (pathName a) aNext
-
-evalExpr :: AllE a => E a -> Y ExpY
-evalExpr a = case a of
-  Ref a -> getVar a >>= return . VarE
-  Const a -> return $ evalConst a
-  Add a b ->  do
-    a <- evalExpr a
-    b <- evalExpr b
-    return $ a :+: b
-  Sub a b ->  do
-    a <- evalExpr a
-    b <- evalExpr b
-    return $ a :-: b
-  Mul a b ->  do
-    a <- evalExpr a
-    return $ a :*: evalConst b
-  Div a b -> do
-    a <- evalExpr a
-    return $ op a $ evalConst b
+  -- Net values bound to pins.
+  netValueCombinations :: [CmdY]
+  netValueCombinations = concatMap f netValues
     where
-    op = case const' b of
-      Bool  _ -> undefined
-      Int   _ -> DIV
-      Float _ -> (:/:)
-  Mod a b -> do
-    a <- evalExpr a
-    return $ MOD a $ evalConst b
-  Not a -> evalExpr a >>= return . NOT
-  And a b -> do
-    a <- evalExpr a
-    b <- evalExpr b
-    return $ AND [a, b]
-  Or a b -> do
-    a <- evalExpr a
-    b <- evalExpr b
-    return $ OR [a, b]
-  Eq a b -> do  
-    a <- evalExpr a
-    b <- evalExpr b
-    return $ a := b
-  Lt a b -> do  
-    a <- evalExpr a
-    b <- evalExpr b
-    return $ a :< b
-  Gt a b -> do  
-    a <- evalExpr a
-    b <- evalExpr b
-    return $ a :> b
-  Le a b -> do  
-    a <- evalExpr a
-    b <- evalExpr b
-    return $ a :<= b
-  Ge a b -> do  
-    a <- evalExpr a
-    b <- evalExpr b
-    return $ a :>= b
-  Mux a b c -> do
-    a <- evalExpr a
-    b <- evalExpr b
-    c <- evalExpr c
-    return $ IF a b c
-
-evalConst :: AllE a => a -> ExpY
-evalConst = evalConst' . const'
-
-evalConst' :: Const -> ExpY
-evalConst' a = case a of
-  Bool  a -> LitB a
-  Int   a -> LitI $ fromIntegral a
-  Float a -> LitR $ toRational a
-
-type Y = StateT Env IO
-
-type Var = String
-
-data Env = Env
-  { nextId    :: Int
-  , var       :: VarInfo -> Var
-  , cmds      :: [CmdY]  -- Commands and variable declarations in reverse order.
-  , asserts   :: [ExpY]  -- Assumes 1 assert in a program under verification.
-  , trace     :: [Trace] -- Program trace in reverse order.
-  }
- 
-initEnv :: Statement -> IO Env
-initEnv program = execStateT (sequence_ [ addVar' a | a@(input, _, _) <- stmtVars program, not input ]) Env
-  { nextId  = 0
-  , var     = \ v -> error $ "variable not found in environment: " ++ pathName v
-  , cmds    = []
-  , asserts = []
-  , trace   = []
-  }
-
-data Trace
-  = Step'  Int
-  | State'  Name Var
-  | Input'  Name Var
-  | Assign' Name Var
-  | Assert' Var
-  | Branch' Var [Trace] [Trace] 
-  | Label'  Name [Trace]
-
-addVar' :: VarInfo -> Y String
-addVar' v = do
-  env <- get
-  let name = printf "n%d" $ nextId env
-  put env { nextId = nextId env + 1, var = \ a -> if a == v then name else var env a, cmds = DEFINE (name, VarT typ) Nothing : cmds env }
-  return name
-  where
-  typ = case v of
-    (_, _, Bool  _) -> "bool"
-    (_, _, Int   _) -> "int"
-    (_, _, Float _) -> "real"
-
-addVar :: AllE a => V a -> Y String
-addVar = addVar' . varInfo
-
--- | Creates a new boolean variable.  Use for assertions.
-newBoolVar :: Y String
-newBoolVar = do
-  env <- get
-  let name = printf "n%d" $ nextId env
-  put env { nextId = nextId env + 1, cmds = DEFINE (name, VarT "bool") Nothing : cmds env }
-  return name
-
-addCmd :: CmdY -> Y ()
-addCmd cmd = do
-  env <- get
-  put env { cmds = cmd : cmds env }
-
-addTrace :: Trace -> Y ()
-addTrace t = do
-  env <- get
-  put env { trace = t : trace env }
-
-getVar :: AllE a => V a -> Y Var
-getVar v = getVar' $ varInfo v
-
-getVar' :: VarInfo -> Y Var
-getVar' v = do
-  env <- get
-  return $ var env $ v
-
-writeTrace :: String -> [ExpY] -> Y ()
-writeTrace name table' = do
-  env <- get
-  let trace' = reverse $ trace env
-      format path indent = printf (printf "%%-%ds : %%s" $ maximum' $ 12 : map maxLabelWidth trace') (intercalate "." path) indent
-      varFormat :: Name -> String
-      varFormat = printf $ printf "%%-%ds" l
+    f :: (Int, [Bool]) -> [CmdY]
+    f (comb, netValues) = concatMap pinValue pinConfigs
+      where
+      -- Bind pin value to net value.
+      pinValue :: Name -> [CmdY]
+      pinValue pinConfig = boolVar pinValue : [ ASSERT $ (VarE pinConfig := LitI net) :=> (VarE pinValue := LitB netValue) | (net, netValue) <- zip [0 ..] netValues ]
         where
-        l = maximum $ 0 : map length ([ n | State' n _ <- trace' ] ++ [ n | Input' n _ <- trace' ])
-  liftIO $ writeFile (name ++ ".trace") $ concatMap (f varFormat format [] "") trace'
+        pinValue = printf "%s_%d" pinConfig comb
+
+  -- Constraints on net values.
+  netValueConstraints :: [CmdY]
+  netValueConstraints = [ASSERT $ OR $ map f netValues]
+    where
+    f :: (Int, [Bool]) -> ExpY
+    f (comb, netValues) = power
+      where
+      power = AND [VarE $ printf "vdd_%d" comb, NOT $ VarE $ printf "gnd_%d" comb]
+      
+
+
+configNetlist :: Int -> Int -> [Name] -> [Name] -> [ExpY] -> Netlist
+configNetlist pCount nCount inputs outputs result = Netlist inputs outputs $ pmos ++ nmos ++ buf
   where
-  table = [ (n, if v then "true" else "false") | VarE n := LitB v <- table' ]
-       ++ [ (n, show v) | VarE n := LitI v <- table' ]
-       ++ [ (n, show v) | VarE n := LitR v <- table' ]
+  pmos = [ PMOS (f $ printf "pmos_%d_gate" i) (f $ printf "pmos_%d_source" i) (f $ printf "pmos_%d_drain" i) | i <- [0 .. pCount] ]
+  nmos = [ NMOS (f $ printf "nmos_%d_gate" i) (f $ printf "nmos_%d_source" i) (f $ printf "nmos_%d_drain" i) | i <- [0 .. nCount] ]
+  buf  = [ BUF (f output) output | output <- outputs, output /= f output ]
 
-  f :: (String -> String) -> (Path -> String -> String) -> Path -> String -> Trace -> String
-  f varFormat format path' indent a = case a of
-    Step' n -> "(step " ++ show n ++ ")\n"
-    State' path var -> case lookup var table of
-      Nothing -> ""
-      Just value -> format ["(state)"] indent ++ varFormat path ++ " == " ++ value ++ "\n"
-    Input' path var -> case lookup var table of
-      Nothing -> ""
-      Just value -> format ["(input)"] indent ++ varFormat path ++ " <== " ++ value ++ "\n"
-    Assign' path var -> case lookup var table of
-      Nothing -> ""
-      Just value -> format path' indent ++ path ++ " <== " ++ value ++ "\n"
-    Assert' var -> case lookup var table of
-      Just "true"  -> format path' indent ++ "theorem assertion passed\n"
-      Just "false" -> format path' indent ++ "theorem assertion FAILED\n"
-      _ -> ""
-    Branch' cond onTrue onFalse -> case lookup cond table of
-      Just "true"  -> format path' indent ++ "ifelse true:\n"  ++ concatMap (f varFormat format path' $ "    " ++ indent) onTrue
-      Just "false" -> format path' indent ++ "ifelse false:\n" ++ concatMap (f varFormat format path' $ "    " ++ indent) onFalse
-      _ -> ""
-    Label' name traces -> concatMap (f varFormat format (path' ++ [name]) indent) traces
+  f :: Name -> Name
+  f name = case lookup name config of
+    Nothing -> error $ "net not found: " ++ name
+    Just net -> netName net
 
-maxLabelWidth :: Trace -> Int
-maxLabelWidth a = case a of
-  Branch' _ a b -> maximum' $ map maxLabelWidth $ a ++ b
-  Label' a b -> length a + 1 + maximum' (map maxLabelWidth b)
-  _ -> 0
+  config :: [(Name, Int)]
+  config = [ (name, fromIntegral net) | VarE name := LitI net <- result ]
 
-maximum' :: [Int] -> Int
-maximum' [] = 0
-maximum' a = maximum a
+  netName :: Int -> Name
+  netName net = case lookup net $ inputNets ++ outputNets of
+    Just name -> name
+    Nothing   -> printf "net_%d" net
+    where
+    inputNets  = [ (net, name) | (name, net) <- config, elem name (["vdd", "gnd"] ++ inputs) ]
+    outputNets = [ (net, name) | (name, net) <- config, elem name outputs ]
+
+{-
+truthTableRow :: Int -> Int -> Int -> (Int, TruthTableRow) -> [CmdY]
+truthTableRow pCount nCount netCount (row, (outputName, outputValue, inputs)) = map boolVar nets ++ inputValues ++ outputValues
+  where
+  nets :: [Name]
+  nets = [ printf "net_%d_%d" net row | net <- [0 .. netCount - 1] ]
+  inputValues  = [ ASSERT $ (VarE inputName  := LitI (fromIntegral net)) :=> (VarE (printf "net_%d_%d" net row) := LitB inputValue ) | (inputName, inputValue) <- inputs, net <- [0 .. netCount - 1] ]
+  outputValues = [ ASSERT $ (VarE outputName := LitI (fromIntegral net)) :=> (VarE (printf "net_%d_%d" net row) := LitB outputValue) | net <- [0 .. netCount - 1] ]
+
+  pmosValues = concat
+    [ [ boolVar gate
+      , boolVar source
+      , boolVar drain
+      , ASSERT $ (VarE gate' := Lit (fromIntegral net)) :=> (VarE gate := VarE (printf "net_%d_%d" net row))  -- XXX This is not going to work.  What happens when a pin is floating?  SMT will pick a value to make it meet the spec.  Need to handle 4-state logic (10xz).
+      ]
+    | trans <- [0 .. pCount - 1]
+    , let gate'   = printf "pmos_%d_gate"   trans
+          source' = printf "pmos_%d_source" trans
+          drain'  = printf "pmos_%d_drain"  trans
+          gate    = printf "%s_%d" gate'   row
+          source  = printf "%s_%d" source' row
+          drain   = printf "%s_%d" drain'  row
+    , net <- [0 .. netCount - 1]
+    ]
+
+    ASSERT $ (VarE outputName := LitI (fromIntegral net)) :=> (VarE (printf "net_%d_%d" net row) := LitB outputValue) | net <- [0 .. netCount - 1] ]
 -}
+
+boolVar :: Name -> CmdY
+boolVar name = DEFINE (name, VarT "bool") Nothing
+
+intVar :: Name -> CmdY
+intVar name = DEFINE (name, VarT "int") Nothing
+
+
+{-
+CMOS design rules.
+
+- Each net has >= 2 connecting pins.
+- Inputs can only connect to gates and outputs.
+- Inputs never tied to other inputs.
+- PMOS sources can only connect to PMOS A net with a connecting gate
+-
+...
+-}
+

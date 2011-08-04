@@ -1,5 +1,5 @@
 .PHONY: all
-all: nets.png inverter.v
+all: inverter.v
 
 nets.png: nets.neato
 	neato -Tpng -o nets.png nets.neato
@@ -9,6 +9,7 @@ inverter.v: Test.hs
 
 .PHONY: clean
 clean:
-	-rm nets.png
+	-rm *.png
 	-rm *.v
+	-rm *.yices
 
