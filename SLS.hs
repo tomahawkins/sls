@@ -26,7 +26,7 @@ data Netlist = Netlist [Net] [Net] [Instance]  -- inputs, outputs, instance
 -- | Synthesis example.
 example :: IO ()
 example = do
-  a <- synthesize 1 1 5
+  a <- synthesize 1 1 1
     [ ("x", True , [("a", False)])
     , ("x", False, [("a", True )])
     ]
@@ -63,7 +63,7 @@ type TruthTableRow  = (Name, Bool, [(Name, Bool)])
 
 -- | Synthesis given the number of transistors, a number of available internal nets, and the logic function.
 synthesize :: Int -> Int -> Int -> TruthTable -> IO (Maybe Netlist)
-synthesize pCount nCount netCount truthTable = do
+synthesize pCount nCount netCountInternal truthTable = do
     writeFile "test.yices" $ unlines $ map show $ smt ++ [CHECK]
     a <- quickCheckY "yices" [] smt
     case a of
@@ -74,37 +74,45 @@ synthesize pCount nCount netCount truthTable = do
   where
 
   smt :: [CmdY]
-  smt = concatMap pinConfig pinConfigs ++ designRules pCount nCount inputs ++ netValueCombinations ++ netValueConstraints
-
-  pinConfig :: Name -> [CmdY]
-  pinConfig name = [intVar name, ASSERT $ AND [VarE name :>= LitI 0, VarE name :< LitI (fromIntegral netCount)]]
+  smt = powerAndInputConstants ++ pinConfigs ++ designRules pCount nCount inputs ++ bindNetValuesToPins ++ pinValueConstraints
 
   inputs  = sort $ nub $ concat [ fst $ unzip a | (_, _, a) <- truthTable ]
   outputs = sort $ nub [ name | (name, _, _) <- truthTable ]
 
-  -- | SMT vars for each pin configuration, i.e. which net it is connected to.
-  pinConfigs :: [Name]
-  pinConfigs = ["vdd", "gnd"]
-      ++ inputs ++ outputs
-      ++ concat [ transistorPins $ printf "pmos_%d" i | i <- [0 .. pCount - 1] ]
-      ++ concat [ transistorPins $ printf "nmos_%d" i | i <- [0 .. nCount - 1] ]
+  -- vdd : gnd : inputs ++ misc nets
+  netCountTotal = netCountInternal + 2 + length inputs
 
-  transistorPins :: Name -> [Name]
-  transistorPins name = [ printf "%s_%s" name pin | pin <- ["gate", "source", "drain"] ]
+  powerAndInputConstants = comment "Power, ground, and input net constants..." ++ concat [ intConst name i | (i, name) <- zip [0 ..] $ ["vdd", "gnd"] ++ inputs ]
 
-  -- All possible net value combinations.
-  netValues :: [(Int, [Bool])]
-  netValues = zip [0 ..] $ sequence $ replicate netCount [False, True]
-
-  -- XXX Only enumerate valid truth table values.  Not everything.  But you don't know the net configuration.  ???
-  -- XXX Make vdd, gnd, and inputs hard coded to the the first nets.  Then only valid input sequences would need to be checked.
-
-  -- Net values bound to pins.
-  netValueCombinations :: [CmdY]
-  netValueCombinations = concatMap f netValues
+  pinConfigNames = outputs ++ concat [ transistorPins $ printf "pmos_%d" i | i <- [0 .. pCount - 1] ] ++ concat [ transistorPins $ printf "nmos_%d" i | i <- [0 .. nCount - 1] ]
     where
+    transistorPins :: Name -> [Name]
+    transistorPins name = [ printf "%s_%s" name pin | pin <- ["gate", "source", "drain"] ]
+
+  -- | SMT vars for each output and transistor pin configuration, i.e. which net it is connected to.
+  pinConfigs :: [CmdY]
+  pinConfigs = comment "Pin-to-net connection configurations..." ++ concatMap pinConfig pinConfigNames
+    where
+    pinConfig :: Name -> [CmdY]
+    pinConfig name = [intVar name, ASSERT $ AND [VarE name :>= LitI 0, VarE name :< LitI (fromIntegral netCountTotal)]]
+
+  -- All possible net value combinations, constrained by input values specified in truthTable.
+  netValues :: [(Int, [Bool])]
+  netValues = zip [0 ..] $ filter inTable $ map ([True, False] ++) $ sequence $ replicate (netCountTotal - 2)  [False, True]
+    where
+    inTable :: [Bool] -> Bool
+    inTable nets = any match truthTable
+      where
+      inputNets = zip inputs $ take (length inputs) $ drop 2 nets
+      match :: TruthTableRow -> Bool
+      match (_, _, inputValues) = sort inputValues == sort [ (name, value) | (name, value) <- inputNets, elem name $ fst $ unzip inputValues ]
+
+  bindNetValuesToPins :: [CmdY]
+  bindNetValuesToPins = comment "Bind net values to transistor and output pins, define power in input constants..." ++ constants ++ concatMap f netValues
+    where
+    constants = concat [ concat [ boolConst (printf "%s_%d" name comb) value | (name, value) <- zip (["vdd", "gnd"] ++ inputs) netValues ] | (comb, netValues) <- netValues ]
     f :: (Int, [Bool]) -> [CmdY]
-    f (comb, netValues) = concatMap pinValue pinConfigs
+    f (comb, netValues) = concatMap pinValue pinConfigNames
       where
       -- Bind pin value to net value.
       pinValue :: Name -> [CmdY]
@@ -112,48 +120,46 @@ synthesize pCount nCount netCount truthTable = do
         where
         pinValue = printf "%s_%d" pinConfig comb
 
-  -- Constraints on net values.
-  netValueConstraints :: [CmdY]
-  netValueConstraints = concatMap f netValues
+  -- Constraints on transistor and output pins.
+  pinValueConstraints :: [CmdY]
+  pinValueConstraints = comment "Pin value constraints..." ++ concatMap f netValues
     where
     f :: (Int, [Bool]) -> [CmdY]
-    f (comb, _) = power ++ io
+    f (comb, _) = io
       where
       value :: String -> ExpY
       value config = VarE $ printf "%s_%d" config comb
-      power    = [ASSERT $ value "vdd", ASSERT $ NOT $ value "gnd"]
       pmos     = [ NOT (value $ printf "pmos_%d_gate" i) :=> (value (printf "pmos_%d_source" i) := value (printf "pmos_%d_drain" i)) | i <- [0 .. pCount - 1] ]
       nmos     = [     (value $ printf "nmos_%d_gate" i) :=> (value (printf "nmos_%d_source" i) := value (printf "nmos_%d_drain" i)) | i <- [0 .. nCount - 1] ]
-      io       = [ ASSERT $ AND [ value input := LitB val | (input, val) <- inputs ] :=> AND (pmos ++ nmos ++ [value output := LitB val]) | (output, val, inputs) <- truthTable ]
+      io       = [ ASSERT $ AND (pmos ++ nmos ++ [value output := LitB val]) :=> AND [ value input := LitB val | (input, val) <- inputs ] | (output, val, inputs) <- truthTable ]
 
 -- Connectivity design rules.
 designRules :: Int -> Int -> [Name] -> [CmdY]
-designRules pCount nCount inputs' = inputsNotConnectedToVDD
-                                 ++ inputsNotConnectedToGND
-                                 ++ inputsNotConnectedToDrains
-                                 ++ inputsNotConnectedToSources
-                                 ++ inputsNotConnectedToOtherInputs
-                                 ++ drainsNotConnectedToVDD
-                                 ++ drainsNotConnectedToGND
-                                 ++ pSourcesNotConnectedToGND
-                                 ++ nSourcesNotConnectedToVDD
+designRules pCount nCount inputs' = comment "Design rule constraints..."
+  ++ inputsNotConnectedToDrains
+  ++ inputsNotConnectedToSources
+  ++ drainsNotConnectedToVDD
+  ++ drainsNotConnectedToGND
+  ++ pSourcesNotConnectedToGND
+  ++ nSourcesNotConnectedToVDD
+  ++ noSelfShorts
   where
   vdd = VarE "vdd"
   gnd = VarE "gnd"
   inputs   = map VarE inputs'
-  pDrains  = [ VarE $ printf "pmos_%d_drain"  i | i <- [0 .. pCount - 1] ]
+  pGates   = [ VarE $ printf "pmos_%d_gate"   i | i <- [0 .. pCount - 1] ]
   pSources = [ VarE $ printf "pmos_%d_source" i | i <- [0 .. pCount - 1] ]
-  nDrains  = [ VarE $ printf "nmos_%d_drain"  i | i <- [0 .. nCount - 1] ]
+  pDrains  = [ VarE $ printf "pmos_%d_drain"  i | i <- [0 .. pCount - 1] ]
+  nGates   = [ VarE $ printf "nmos_%d_gate"   i | i <- [0 .. nCount - 1] ]
   nSources = [ VarE $ printf "nmos_%d_source" i | i <- [0 .. nCount - 1] ]
-  inputsNotConnectedToVDD = [ ASSERT $ vdd :/= input | input <- inputs ]
-  inputsNotConnectedToGND = [ ASSERT $ gnd :/= input | input <- inputs ]
+  nDrains  = [ VarE $ printf "nmos_%d_drain"  i | i <- [0 .. nCount - 1] ]
   inputsNotConnectedToDrains  = [ ASSERT $ input :/= drain  | input <- inputs, drain  <- pDrains  ++ nDrains  ]
   inputsNotConnectedToSources = [ ASSERT $ input :/= source | input <- inputs, source <- pSources ++ nSources ]
-  inputsNotConnectedToOtherInputs = [ ASSERT $ VarE a :/= VarE b | a <- inputs', b <- inputs', a /= b ]
   drainsNotConnectedToVDD = [ ASSERT $ vdd :/= drain | drain <- pDrains ++ nDrains ]
   drainsNotConnectedToGND = [ ASSERT $ gnd :/= drain | drain <- pDrains ++ nDrains ]
   pSourcesNotConnectedToGND = [ ASSERT $ gnd :/= source | source <- pSources ]
   nSourcesNotConnectedToVDD = [ ASSERT $ vdd :/= source | source <- nSources ]
+  noSelfShorts = [ ASSERT $ AND [gate :/= source, gate :/= drain, source :/= drain] | (gate, source, drain) <- zip3 (pGates ++ nGates) (pSources ++ nSources) (pDrains ++ nDrains) ]
 
 
 configNetlist :: Int -> Int -> [Name] -> [Name] -> [ExpY] -> Netlist
@@ -182,9 +188,17 @@ configNetlist pCount nCount inputs outputs result = Netlist inputs outputs $ pmo
 boolVar :: Name -> CmdY
 boolVar name = DEFINE (name, VarT "bool") Nothing
 
+boolConst :: Name -> Bool -> [CmdY]
+boolConst name value = [boolVar name, ASSERT (VarE name := LitB value)]
+
 intVar :: Name -> CmdY
 intVar name = DEFINE (name, VarT "int") Nothing
 
+intConst :: Name -> Int -> [CmdY]
+intConst name value = [intVar name, ASSERT (VarE name := LitI (fromIntegral value))]
+
+comment :: String -> [CmdY]
+comment _ = [] --[ECHO "", ECHO a]
 
 {-
 CMOS design rules.
