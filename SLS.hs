@@ -1,6 +1,5 @@
 module SLS
-  ( Net
-  , Name
+  ( Name
   , Instance (..)
   , Netlist  (..)
   , synthesize
@@ -13,15 +12,15 @@ import Math.SMT.Yices.Pipe
 import Math.SMT.Yices.Syntax
 import Text.Printf
 
-type Net  = String
 type Name = String
 
-data Instance
-  = PMOS Net Net Net  -- gate, source, drain
-  | NMOS Net Net Net  -- gate, source, drain
-  | BUF  Net Net      -- input, output
+data Instance a
+  = PMOS a a a  -- gate, source, drain
+  | NMOS a a a  -- gate, source, drain
+  | OUT  Name a
+  deriving Show
 
-data Netlist = Netlist [Net] [Net] [Instance]  -- inputs, outputs, instance
+data Netlist = Netlist [Name] [Instance Name]  -- inputs, instances.
 
 -- | Synthesis example.
 example :: IO ()
@@ -36,7 +35,7 @@ example = do
 
 -- | Output a Verilog switch level netlist.
 netlist :: Name -> Netlist -> String
-netlist name (Netlist ins outs instances) = unlines
+netlist name (Netlist ins instances) = unlines
   [ "module " ++ name
   , "\t( input  vdd"
   , "\t, input  gnd"
@@ -47,15 +46,16 @@ netlist name (Netlist ins outs instances) = unlines
   , "endmodule"
   ]
   where
+  outs = sort [ name | OUT name _ <- instances ]
   nets a = case a of
     PMOS a b c -> [a, b, c]
     NMOS a b c -> [a, b, c]
-    BUF  a b   -> [a, b]
+    OUT  _ a   -> [a]
 
   instantiate a = case a of
     PMOS gate source drain -> printf "pmos (%s, %s, %s);" drain source gate
     NMOS gate source drain -> printf "nmos (%s, %s, %s);" drain source gate
-    BUF  input output      -> printf "buf  (%s, %s);" output input
+    OUT  name net          -> printf "buf  (%s, %s);" name net
 
 -- | Each row is output name and value, and a list of input names and values.
 type TruthTable = [TruthTableRow]
@@ -64,24 +64,27 @@ type TruthTableRow  = (Name, Bool, [(Name, Bool)])
 -- | Synthesis given the number of transistors, a number of available internal nets, and the logic function.
 synthesize :: Int -> Int -> Int -> TruthTable -> IO (Maybe Netlist)
 synthesize pCount nCount netCountInternal truthTable = do
-    writeFile "test.yices" $ unlines $ map show $ smt ++ [CHECK]
-    a <- quickCheckY "yices" [] smt
-    case a of
-      Sat a -> do
-        writeFile "result.yices" $ unlines $ map show a
-        return $ Just $ configNetlist pCount nCount inputs outputs a
-      a -> print a >> return Nothing
+  mapM_ print configurations
+  print $ length configurations
+  return $ Just $ configNetlist inputs $ head configurations
   where
-
-  smt :: [CmdY]
-  smt = powerAndInputConstants ++ pinConfigs ++ designRules pCount nCount inputs ++ bindNetValuesToPins ++ pinValueConstraints
-
-  inputs  = sort $ nub $ concat [ fst $ unzip a | (_, _, a) <- truthTable ]
-  outputs = sort $ nub [ name | (name, _, _) <- truthTable ]
 
   -- vdd : gnd : inputs ++ misc nets
   netCountTotal = netCountInternal + 2 + length inputs
 
+  -- Order p_0_gate, p_0_source, p_0_drain
+  configurations :: [[Instance Int]]
+  configurations = filter (drc $ length inputs) permutations
+    where
+    pmosPermutations   = [ PMOS gate source drain | [gate, source, drain] <- sequence [all, all, all] ]
+    nmosPermutations   = [ NMOS gate source drain | [gate, source, drain] <- sequence [all, all, all] ]
+    permutations       = sequence $ replicate pCount pmosPermutations ++ replicate nCount nmosPermutations ++ [ [ OUT name net | net <- all ]  | name <- outputs ]
+    all = [0 .. netCountTotal - 1]
+
+  inputs  = sort $ nub $ concat [ fst $ unzip a | (_, _, a) <- truthTable ]
+  outputs = sort $ nub [ name | (name, _, _) <- truthTable ]
+
+{-
   powerAndInputConstants = comment "Power, ground, and input net constants..." ++ concat [ intConst name i | (i, name) <- zip [0 ..] $ ["vdd", "gnd"] ++ inputs ]
 
   pinConfigNames = outputs ++ concat [ transistorPins $ printf "pmos_%d" i | i <- [0 .. pCount - 1] ] ++ concat [ transistorPins $ printf "nmos_%d" i | i <- [0 .. nCount - 1] ]
@@ -132,58 +135,48 @@ synthesize pCount nCount netCountInternal truthTable = do
       pmos     = [ NOT (value $ printf "pmos_%d_gate" i) :=> (value (printf "pmos_%d_source" i) := value (printf "pmos_%d_drain" i)) | i <- [0 .. pCount - 1] ]
       nmos     = [     (value $ printf "nmos_%d_gate" i) :=> (value (printf "nmos_%d_source" i) := value (printf "nmos_%d_drain" i)) | i <- [0 .. nCount - 1] ]
       io       = [ ASSERT $ AND (pmos ++ nmos ++ [value output := LitB val]) :=> AND [ value input := LitB val | (input, val) <- inputs ] | (output, val, inputs) <- truthTable ]
+-}
 
--- Connectivity design rules.
-designRules :: Int -> Int -> [Name] -> [CmdY]
-designRules pCount nCount inputs' = comment "Design rule constraints..."
-  ++ inputsNotConnectedToDrains
-  ++ inputsNotConnectedToSources
-  ++ drainsNotConnectedToVDD
-  ++ drainsNotConnectedToGND
-  ++ pSourcesNotConnectedToGND
-  ++ nSourcesNotConnectedToVDD
-  ++ noSelfShorts
+vdd = 0
+gnd = 1
+
+drc :: Int -> [Instance Int] -> Bool
+drc inputs instances = all drainsNotConnectedToInputsOrPower instances
+                    && all sourcesNotConnectedToInputs       instances
+                    && all sourcesNotConnectedToWrongSupply  instances
+                    && all noPinToPin                        instances
   where
-  vdd = VarE "vdd"
-  gnd = VarE "gnd"
-  inputs   = map VarE inputs'
-  pGates   = [ VarE $ printf "pmos_%d_gate"   i | i <- [0 .. pCount - 1] ]
-  pSources = [ VarE $ printf "pmos_%d_source" i | i <- [0 .. pCount - 1] ]
-  pDrains  = [ VarE $ printf "pmos_%d_drain"  i | i <- [0 .. pCount - 1] ]
-  nGates   = [ VarE $ printf "nmos_%d_gate"   i | i <- [0 .. nCount - 1] ]
-  nSources = [ VarE $ printf "nmos_%d_source" i | i <- [0 .. nCount - 1] ]
-  nDrains  = [ VarE $ printf "nmos_%d_drain"  i | i <- [0 .. nCount - 1] ]
-  inputsNotConnectedToDrains  = [ ASSERT $ input :/= drain  | input <- inputs, drain  <- pDrains  ++ nDrains  ]
-  inputsNotConnectedToSources = [ ASSERT $ input :/= source | input <- inputs, source <- pSources ++ nSources ]
-  drainsNotConnectedToVDD = [ ASSERT $ vdd :/= drain | drain <- pDrains ++ nDrains ]
-  drainsNotConnectedToGND = [ ASSERT $ gnd :/= drain | drain <- pDrains ++ nDrains ]
-  pSourcesNotConnectedToGND = [ ASSERT $ gnd :/= source | source <- pSources ]
-  nSourcesNotConnectedToVDD = [ ASSERT $ vdd :/= source | source <- nSources ]
-  noSelfShorts = [ ASSERT $ AND [gate :/= source, gate :/= drain, source :/= drain] | (gate, source, drain) <- zip3 (pGates ++ nGates) (pSources ++ nSources) (pDrains ++ nDrains) ]
+  drainsNotConnectedToInputsOrPower a = case a of
+    PMOS _ _ drain -> drain >= inputs + 2
+    NMOS _ _ drain -> drain >= inputs + 2
+    _ -> True
+  sourcesNotConnectedToInputs a = case a of
+    PMOS _ source _ -> source < 2 || source >= inputs + 2
+    NMOS _ source _ -> source < 2 || source >= inputs + 2
+    _ -> True
+  sourcesNotConnectedToWrongSupply a = case a of
+    PMOS _ source _ -> source /= gnd
+    NMOS _ source _ -> source /= vdd
+    _ -> True
+  noPinToPin a = case a of
+    PMOS gate source drain -> gate /= source && source /= drain && gate /= drain
+    NMOS gate source drain -> gate /= source && source /= drain && gate /= drain
+    _ -> True
 
 
-configNetlist :: Int -> Int -> [Name] -> [Name] -> [ExpY] -> Netlist
-configNetlist pCount nCount inputs outputs result = Netlist inputs outputs $ pmos ++ nmos ++ buf
+configNetlist :: [Name] -> [Instance Int] -> Netlist
+configNetlist inputs instances = Netlist inputs $ pmos ++ nmos ++ buf
   where
-  pmos = [ PMOS (f $ printf "pmos_%d_gate" i) (f $ printf "pmos_%d_source" i) (f $ printf "pmos_%d_drain" i) | i <- [0 .. pCount - 1] ]
-  nmos = [ NMOS (f $ printf "nmos_%d_gate" i) (f $ printf "nmos_%d_source" i) (f $ printf "nmos_%d_drain" i) | i <- [0 .. nCount - 1] ]
-  buf  = [ BUF (f output) output | output <- outputs, output /= f output ]
+  pmos = [ PMOS (f g) (f s) (f d)  | PMOS g s d   <- instances ]
+  nmos = [ NMOS (f g) (f s) (f d)  | NMOS g s d   <- instances ]
+  buf  = [ OUT  name  (f n)        | OUT name n <- instances ]
 
-  f :: Name -> Name
-  f name = case lookup name config of
-    Nothing -> error $ "net not found: " ++ name
-    Just net -> netName net
-
-  config :: [(Name, Int)]
-  config = [ (name, fromIntegral net) | VarE name := LitI net <- result ]
-
-  netName :: Int -> Name
-  netName net = case lookup net $ inputNets ++ outputNets of
-    Just name -> name
-    Nothing   -> printf "net_%d" net
-    where
-    inputNets  = [ (net, name) | (name, net) <- config, elem name (["vdd", "gnd"] ++ inputs) ]
-    outputNets = [ (net, name) | (name, net) <- config, elem name outputs ]
+  f :: Int -> Name
+  f net = case net of
+    0 -> "vdd"
+    1 -> "gnd"
+    n | n - 2 < length inputs -> inputs !! (n - 2)
+      | otherwise -> printf "net_%d" (n - 2 - length inputs)
 
 boolVar :: Name -> CmdY
 boolVar name = DEFINE (name, VarT "bool") Nothing
