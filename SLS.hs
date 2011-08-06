@@ -8,6 +8,7 @@ module SLS
   ) where
 
 import Data.List
+import Data.Maybe
 import Math.SMT.Yices.Pipe
 import Math.SMT.Yices.Syntax
 import Text.Printf
@@ -64,13 +65,21 @@ type TruthTableRow  = (Name, Bool, [(Name, Bool)])
 -- | Synthesis given the number of transistors, a number of available internal nets, and the logic function.
 synthesize :: Int -> Int -> Int -> TruthTable -> IO (Maybe Netlist)
 synthesize pCount nCount netCountInternal truthTable = do
-  mapM_ print configurations
   print $ length configurations
-  return $ Just $ configNetlist inputs $ head configurations
+  verified $ zip [0 ..] configurations
   where
 
   -- vdd : gnd : inputs ++ misc nets
   netCountTotal = netCountInternal + 2 + length inputs
+
+  verified :: [(Int, [Instance Int])] -> IO (Maybe Netlist)
+  verified [] = return Nothing
+  verified ((n, a) : b) = do
+    writeFile (printf "netlist%d.v" n) $ netlist "inverter" $ configNetlist inputs a
+    r <- verify netCountTotal inputs truthTable (n, a)
+    if False --r
+      then return $ Just $ configNetlist inputs a
+      else putStrLn "failed to verify" >> verified b
 
   -- Order p_0_gate, p_0_source, p_0_drain
   configurations :: [[Instance Int]]
@@ -162,6 +171,28 @@ drc inputs instances = all drainsNotConnectedToInputsOrPower instances
     PMOS gate source drain -> gate /= source && source /= drain && gate /= drain
     NMOS gate source drain -> gate /= source && source /= drain && gate /= drain
     _ -> True
+
+verify :: Int -> [Name] -> TruthTable -> (Int, [Instance Int]) -> IO Bool
+verify totalNets inputs truthTable (n, instances) = do
+  writeFile (printf "config%d.yices" n) $ unlines $ map show $ smt ++ [CHECK]
+  r <- quickCheckY "yices" [] smt
+  case r of
+    UnSat _ -> return True
+    _ -> return False
+  where
+  f :: Int -> ExpY
+  f a = VarE $ printf "n%d" a
+  smt = [ boolVar $ printf "n%d" net | net <- [0 .. totalNets - 1] ] ++ [ASSERT $ f 0 := LitB True, ASSERT $ f 1 := LitB False] ++ [ASSERT $ NOT $ AND (power ++ pmos ++ nmos) :=> AND table]
+  power = [f 0 := LitB True, f 1 := LitB False]
+  pmos  = [ NOT (f gate) :=> (f source := f drain) | PMOS gate source drain <- instances ]
+  nmos  = [     (f gate) :=> (f source := f drain) | NMOS gate source drain <- instances ]
+  table = [ AND [ inputNet inputName := LitB inputValue | (inputName, inputValue) <- inputs ] :=> (outputNet outputName := LitB outputValue) | (outputName, outputValue, inputs) <- truthTable ]
+
+  outputNet :: Name -> ExpY
+  outputNet name = f $ head [ net | OUT name' net <- instances ]
+
+  inputNet :: Name -> ExpY
+  inputNet name = f (2 + (fromJust $ elemIndex name inputs))
 
 
 configNetlist :: [Name] -> [Instance Int] -> Netlist
