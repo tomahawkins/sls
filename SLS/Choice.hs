@@ -1,40 +1,33 @@
-module SLS
-  ( Net      (..)
-  , Instance (..)
-  , Netlist  (..)
-  , Name
-  , TruthTable
-  , TruthTableRow
-  -- , synthesize
-  , verilog
-  -- , example
+module SLS.Choice
+  ( initialChoices
+  , nextChoices
   ) where
 
 import Data.List
-import Data.Maybe
-import Math.SMT.Yices.Pipe
-import Math.SMT.Yices.Syntax
-import Text.Printf
 
 import SLS.Netlist
 
--- | Each row is output name and value, and a list of input names and values.
-type PortValue = (Name, Bool)
-type TruthTableRow  = ([PortValue], [PortValue]) -- (inputs, outputs)
-type TruthTable = [TruthTableRow]
+-- | A list of starting netlists.
+initialChoices :: [Name] -> [Name] -> [Netlist]
+initialChoices inputs outputs = f outputs empty
+  where
+  f :: [Name] -> Netlist -> [Netlist]
+  f [] a = [a]
+  f (output : outputs) (Netlist next instances) = concatMap (f outputs) $
+    [ Netlist next (Output output VDD : instances)
+    , Netlist next (Output output GND : instances)
+    , Netlist (next + 1) (Output output (Net next) : instances)
+    ] ++ [ Netlist next (Output output (Input input) : instances) | input <- inputs ]
+
+-- | Given a list of inputs and a partially constructed netlist, returns a new list of further constructed netlists.  Assumes outputs are included.
+nextChoices :: [Name] -> Netlist -> [Netlist]
+nextChoices inputs netlist@(Netlist next instances) = addPMOS ++ addNMOS ++ connectOutput
+  where
+  addPMOS = [ Netlist (next + 2) (PMOS (Net next) source (Net $ next + 1) : instances) | source <- VDD : pDrains netlist ]
+  addNMOS = [ Netlist (next + 2) (NMOS (Net next) source (Net $ next + 1) : instances) | source <- GND : nDrains netlist ]
+  connectOutput = [ Netlist next $ Output name drain : delete output instances | output@(Output name net@(Net _)) <- instances, notElem net $ drains netlist, drain <- drains netlist ]
 
 {-
--- | Synthesis example.
-example :: IO ()
-example = do
-  a <- synthesize 1 2 2
-    [ ([("a", False)], [("x", True )])
-    , ([("a", True )], [("x", False)])
-    ]
-  case a of
-    Nothing -> putStrLn "Synthesis failed."
-    Just a  -> putStrLn $ verilog "inverter" a
-
 -- | Synthesis given the number of transistors, a number of available internal nets, and the logic function.
 synthesize :: Int -> Int -> Int -> TruthTable -> IO (Maybe Netlist)
 synthesize pCount nCount netCountInternal truthTable = do
